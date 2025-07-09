@@ -4,6 +4,10 @@ import time
 import torch
 import torchvision
 import pytorch_lightning as pl
+# 解决 PyTorch 2.6 权重加载报错
+import torch
+import pytorch_lightning.callbacks.model_checkpoint
+torch.serialization.add_safe_globals([pytorch_lightning.callbacks.model_checkpoint.ModelCheckpoint])
 
 from packaging import version
 from omegaconf import OmegaConf
@@ -416,6 +420,28 @@ class CUDACallback(Callback):
         except AttributeError:
             pass
 
+def summarize_grad_status(named_parameters, name):
+    total = 0
+    frozen = 0
+    unfrozen_params = []
+    for n, p in named_parameters:
+        total += 1
+        if not p.requires_grad:
+            frozen += 1
+        else:
+            unfrozen_params.append(n)
+
+    print(f"\n====== {name} 状态 ======")
+    print(f"总参数数: {total}")
+    print(f"已冻结参数: {frozen}")
+    print(f"未冻结参数: {total - frozen}")
+    if unfrozen_params:
+        print("未冻结的参数有：")
+        for n in unfrozen_params:
+            print("  -", n)
+    else:
+        print("❄️ 全部被冻结")
+    print("========================\n")
 
 if __name__ == "__main__":
     from collections import OrderedDict
@@ -546,13 +572,13 @@ if __name__ == "__main__":
     trainer_opt = argparse.Namespace(**trainer_config)
     lightning_config.trainer = trainer_config
 
-    # model
     model = instantiate_from_config(config.model)
 
-    model.configs = config
+    # ✅ 更清晰地打印冻结状态
+    summarize_grad_status(model.first_stage_model.named_parameters(), "Autoencoder (first_stage_model)")
+    summarize_grad_status(model.model.diffusion_model.named_parameters(), "UNet (model.diffusion_model)")
 
-    # trainer and callbacks
-    trainer_kwargs = dict()
+
 
     # default logger configs
     default_logger_cfgs = {
@@ -581,6 +607,7 @@ if __name__ == "__main__":
     else:
         logger_cfg = OmegaConf.create()
     logger_cfg = OmegaConf.merge(default_logger_cfg, logger_cfg)
+    trainer_kwargs = dict()
     trainer_kwargs["logger"] = instantiate_from_config(logger_cfg)
 
     # modelcheckpoint - use TrainResult/EvalResult(checkpoint_on=metric) to
@@ -692,7 +719,10 @@ if __name__ == "__main__":
     # configure learning rate
     bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
     if not cpu:
-        ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
+        gpus = str(lightning_config.trainer.gpus)  # 强制将其转换为字符串
+        ngpu = len(gpus.strip(",").split(','))
+
+
     else:
         ngpu = 1
     if 'accumulate_grad_batches' in lightning_config.trainer:

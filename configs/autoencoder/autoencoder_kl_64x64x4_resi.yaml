@@ -1,6 +1,6 @@
 model:
   base_learning_rate: 5.0e-5
-  target: ldm.models.autoencoder.AutoencoderKLResi
+  target: ldm.models.autoencoder.AutoencoderKLResiPlus
   params:
     # for training only
     # ckpt_path: /mnt/lustre/jywang/code/stable_diffmodels/v2-1_512-ema-pruned.ckpt

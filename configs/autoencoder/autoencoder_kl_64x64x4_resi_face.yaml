@@ -1,6 +1,6 @@
 model:
   base_learning_rate: 5.0e-5
-  target: ldm.models.autoencoder.AutoencoderKLResi
+  target: ldm.models.autoencoder.AutoencoderKLResiPlus
   params:
     # for training only
     # ckpt_path: vqgan_finetune_00011.ckpt

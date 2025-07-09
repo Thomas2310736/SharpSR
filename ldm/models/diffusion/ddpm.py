@@ -304,7 +304,7 @@ class DDPM(pl.LightningModule):
                     print(f"{context}: Restored training weights")
 
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
-        sd = torch.load(path, map_location="cpu")
+        sd = torch.load(path, map_location="cpu", weights_only=False)
         if "state_dict" in list(sd.keys()):
             sd = sd["state_dict"]
         keys = list(sd.keys())
@@ -1563,26 +1563,32 @@ class LatentDiffusion(DDPM):
 class LatentDiffusionSRTextWT(DDPM):
     """main class"""
     def __init__(self,
-                 first_stage_config,
-                 cond_stage_config,
-                 structcond_stage_config,
-                 num_timesteps_cond=None,
-                 cond_stage_key="image",
-                 cond_stage_trainable=False,
-                 concat_mode=True,
-                 cond_stage_forward=None,
-                 conditioning_key=None,
-                 scale_factor=1.0,
-                 scale_by_std=False,
-                 unfrozen_diff=False,
-                 random_size=False,
-                 test_gt=False,
-                 p2_gamma=None,
-                 p2_k=None,
-                 time_replace=None,
-                 use_usm=False,
-                 mix_ratio=0.0,
-                 *args, **kwargs):
+             first_stage_config,
+             cond_stage_config,
+             structcond_stage_config,
+             num_timesteps_cond=None,
+             cond_stage_key="image",
+             cond_stage_trainable=False,
+             concat_mode=True,
+             cond_stage_forward=None,
+             conditioning_key=None,
+             scale_factor=1.0,
+             scale_by_std=False,
+             unfrozen_diff=False,
+             random_size=False,
+             test_gt=False,
+             p2_gamma=None,
+             p2_k=None,
+             time_replace=None,
+             use_usm=False,
+             mix_ratio=0.0,
+             configs=None,
+             freeze_first_stage=False,  # ✅ 添加这个参数
+             *args, **kwargs):
+        
+        self.configs = configs
+        self.freeze_first_stage = freeze_first_stage  # ✅ 保存参数
+
         # put this in your init
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
@@ -1600,6 +1606,11 @@ class LatentDiffusionSRTextWT(DDPM):
             conditioning_key = None
         ckpt_path = kwargs.pop("ckpt_path", None)
         ignore_keys = kwargs.pop("ignore_keys", [])
+        
+        # ✅ 确保 freeze_first_stage 不会传递给父类
+        if 'freeze_first_stage' in kwargs:
+            kwargs.pop('freeze_first_stage')
+            
         super().__init__(conditioning_key=conditioning_key, *args, **kwargs)
         self.concat_mode = concat_mode
         self.cond_stage_trainable = cond_stage_trainable
@@ -1663,8 +1674,8 @@ class LatentDiffusionSRTextWT(DDPM):
 
         # Support time respacing during training
         if self.time_replace is None:
-            self.time_replace = kwargs['timesteps']
-        use_timesteps = set(space_timesteps(kwargs['timesteps'], [self.time_replace]))
+            self.time_replace = kwargs['timesteps'] if 'timesteps' in kwargs else 1000
+        use_timesteps = set(space_timesteps(kwargs.get('timesteps', 1000), [self.time_replace]))
         last_alpha_cumprod = 1.0
         new_betas = []
         timestep_map = []
@@ -1674,7 +1685,9 @@ class LatentDiffusionSRTextWT(DDPM):
                 last_alpha_cumprod = alpha_cumprod
                 timestep_map.append(i)
         new_betas = [beta.data.cpu().numpy() for beta in new_betas]
-        self.register_schedule(given_betas=np.array(new_betas), timesteps=len(new_betas), linear_start=kwargs['linear_start'], linear_end=kwargs['linear_end'])
+        self.register_schedule(given_betas=np.array(new_betas), timesteps=len(new_betas), 
+                              linear_start=kwargs.get('linear_start', 1e-4), 
+                              linear_end=kwargs.get('linear_end', 2e-2))
         self.ori_timesteps = list(use_timesteps)
         self.ori_timesteps.sort()
 
@@ -1711,10 +1724,22 @@ class LatentDiffusionSRTextWT(DDPM):
 
     def instantiate_first_stage(self, config):
         model = instantiate_from_config(config)
-        self.first_stage_model = model.eval()
-        self.first_stage_model.train = disabled_train
-        for param in self.first_stage_model.parameters():
-            param.requires_grad = False
+        self.first_stage_model = model
+
+        # ✅ 修改：使用实例变量而不是从config获取
+        freeze = self.freeze_first_stage
+
+        if freeze:
+            self.first_stage_model.eval()
+            self.first_stage_model.train = disabled_train
+            for param in self.first_stage_model.parameters():
+                param.requires_grad = False
+            print(f"First stage model (autoencoder) frozen: {freeze}")
+        else:
+            self.first_stage_model.train()
+            for param in self.first_stage_model.parameters():
+                param.requires_grad = True
+            print(f"First stage model (autoencoder) trainable: {not freeze}")
 
     def instantiate_cond_stage(self, config):
         if not self.cond_stage_trainable:

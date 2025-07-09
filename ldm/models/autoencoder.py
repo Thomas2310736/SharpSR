@@ -1,23 +1,28 @@
 import torch
-import pytorch_lightning as pl
 import torch.nn.functional as F
+import pytorch_lightning as pl
+import random
+import torchvision.transforms as transforms
 from contextlib import contextmanager
-
+from packaging import version
 from taming.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
 
 from ldm.modules.diffusionmodules.model import Encoder, Decoder, Decoder_Mix
 from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
-
 from ldm.util import instantiate_from_config
 
 from basicsr.utils import DiffJPEG, USMSharp
 from basicsr.utils.img_process_util import filter2D
 from basicsr.data.transforms import paired_random_crop, triplet_random_crop
-from basicsr.data.degradations import random_add_gaussian_noise_pt, random_add_poisson_noise_pt, random_add_speckle_noise_pt, random_add_saltpepper_noise_pt
-import random
+from basicsr.data.degradations import (
+    random_add_gaussian_noise_pt,
+    random_add_poisson_noise_pt,
+    random_add_speckle_noise_pt,
+    random_add_saltpepper_noise_pt,
+)
 
-import torchvision.transforms as transforms
-
+from .DGConv import DGConvModule  # 从 DGConv 文件中导入 DGConvModule
+from .DGConv import OptimizedDGConvModule
 
 class VQModel(pl.LightningModule):
     def __init__(self,
@@ -84,7 +89,7 @@ class VQModel(pl.LightningModule):
                     print(f"{context}: Restored training weights")
 
     def init_from_ckpt(self, path, ignore_keys=list()):
-        sd = torch.load(path, map_location="cpu")["state_dict"]
+        sd = torch.load(path, map_location="cpu", weights_only=False)["state_dict"]
         keys = list(sd.keys())
         for k in keys:
             for ik in ignore_keys:
@@ -317,7 +322,7 @@ class AutoencoderKL(pl.LightningModule):
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
 
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
-        sd = torch.load(path, map_location="cpu")
+        sd = torch.load(path, map_location="cpu", weights_only=False)
         if "state_dict" in list(sd.keys()):
             sd = sd["state_dict"]
         keys = list(sd.keys())
@@ -538,7 +543,7 @@ class AutoencoderKLResi(pl.LightningModule):
         # print(untrainable_list)
 
     # def init_from_ckpt(self, path, ignore_keys=list()):
-    #     sd = torch.load(path, map_location="cpu")["state_dict"]
+    #     sd = torch.load(path, map_location="cpu", weights_only=False)["state_dict"]
     #     keys = list(sd.keys())
     #     for k in keys:
     #         for ik in ignore_keys:
@@ -549,7 +554,7 @@ class AutoencoderKLResi(pl.LightningModule):
     #     print(f"Restored from {path}")
 
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
-        sd = torch.load(path, map_location="cpu")
+        sd = torch.load(path, map_location="cpu", weights_only=False)
         if "state_dict" in list(sd.keys()):
             sd = sd["state_dict"]
         keys = list(sd.keys())
@@ -917,3 +922,204 @@ class AutoencoderKLResi(pl.LightningModule):
         x = F.conv2d(x, weight=self.colorize)
         x = 2.*(x-x.min())/(x.max()-x.min()) - 1.
         return x
+class AutoencoderKLResiPlus(AutoencoderKLResi):
+    def __init__(self,
+                 ddconfig,
+                 lossconfig,
+                 embed_dim,
+                 ckpt_path=None,
+                 ignore_keys=[],
+                 image_key="image",
+                 colorize_nlabels=None,
+                 monitor=None,
+                 fusion_w=1.0,
+                 freeze_dec=True,
+                 synthesis_data=False,
+                 use_usm=False,
+                 test_gt=False,
+                 dgconv_config=None):
+        """
+        增强版AutoencoderKL，集成DGConv模块
+        
+        Args:
+            dgconv_config (dict): DGConv配置，包含:
+                - type: 'standard', 'optimized', 或 'lightweight'
+                - kernel_size: 卷积核大小，默认3
+                - use_aiiblock: 是否使用AIIBlock，默认True
+                - positions: DGConv插入位置列表，如['encoder_output', 'encoder_middle', 'decoder_input']
+                - encoder_channels: encoder各阶段的通道数列表
+        """
+        super().__init__(ddconfig, lossconfig, embed_dim, ckpt_path, ignore_keys, image_key, colorize_nlabels,
+                         monitor, fusion_w, freeze_dec, synthesis_data, use_usm, test_gt)
+
+        # 默认DGConv配置
+        if dgconv_config is None:
+            dgconv_config = {
+                'type': 'optimized',
+                'kernel_size': 3,
+                'use_aiiblock': True,
+                'positions': ['encoder_output'],
+                'encoder_channels': None
+            }
+        
+        self.dgconv_config = dgconv_config
+        self.dgconv_type = dgconv_config.get('type', 'optimized')
+        self.dgconv_kernel_size = dgconv_config.get('kernel_size', 3)
+        self.use_aiiblock = dgconv_config.get('use_aiiblock', True)
+        self.dgconv_positions = dgconv_config.get('positions', ['encoder_output'])
+        
+        # 初始化DGConv模块
+        self._init_dgconv_modules()
+        
+        # 如果需要在decoder中使用增强特征，则初始化enhanced_decoder
+        if 'decoder_input' in self.dgconv_positions or 'decoder_middle' in self.dgconv_positions:
+            self.enhanced_decoder = self._create_enhanced_decoder(ddconfig)
+            self.enhanced_decoder.fusion_w = fusion_w
+        else:
+            self.enhanced_decoder = None
+
+    def _init_dgconv_modules(self):
+        """初始化DGConv模块"""
+        self.dgconv_modules = nn.ModuleDict()
+        
+        # 根据配置的位置初始化不同的DGConv模块
+        if 'encoder_output' in self.dgconv_positions:
+            # encoder输出的通道数通常是z_channels * 2（均值和方差）
+            encoder_out_channels = self.ddconfig.get('z_channels', 4) * 2
+            self.dgconv_modules['encoder_output'] = self._create_dgconv(encoder_out_channels)
+        
+        if 'encoder_middle' in self.dgconv_positions:
+            # 需要修改encoder以支持中间层DGConv
+            encoder_channels = self.dgconv_config.get('encoder_channels', None)
+            if encoder_channels:
+                for i, ch in enumerate(encoder_channels):
+                    self.dgconv_modules[f'encoder_stage_{i}'] = self._create_dgconv(ch)
+        
+        if 'decoder_input' in self.dgconv_positions:
+            # decoder输入的通道数
+            decoder_in_channels = self.ddconfig.get('z_channels', 4)
+            self.dgconv_modules['decoder_input'] = self._create_dgconv(decoder_in_channels)
+
+    def _create_dgconv(self, channels):
+        """创建DGConv模块"""
+        if self.dgconv_type == 'standard':
+            from your_dgconv_module import DGConvModule
+            return DGConvModule(
+                in_channels=channels,
+                out_channels=channels,
+                kernel_size=self.dgconv_kernel_size,
+                use_aiiblock=self.use_aiiblock
+            )
+        elif self.dgconv_type == 'optimized':
+            from your_dgconv_module import OptimizedDGConvModule
+            return OptimizedDGConvModule(
+                channels=channels,
+                kernel_size=self.dgconv_kernel_size,
+                use_aiiblock=self.use_aiiblock
+            )
+        elif self.dgconv_type == 'lightweight':
+            from your_dgconv_module import LightweightDGConvModule
+            return LightweightDGConvModule(
+                channels=channels,
+                kernel_size=self.dgconv_kernel_size,
+                use_aiiblock=self.use_aiiblock
+            )
+        else:
+            raise ValueError(f"Unknown dgconv_type: {self.dgconv_type}")
+
+    def _create_enhanced_decoder(self, ddconfig):
+        """创建增强的解码器（如果需要）"""
+        # 这里假设Decoder_Mix是您的自定义解码器
+        # 如果需要在解码器中集成DGConv，可以创建一个新的解码器类
+        return Decoder_Mix(**ddconfig)
+
+    def encode(self, x):
+        """增强的编码过程"""
+        # 如果需要在encoder中间层使用DGConv，需要修改encoder
+        if 'encoder_middle' in self.dgconv_positions and hasattr(self, 'enhanced_encoder'):
+            h, enc_fea = self.enhanced_encoder(x, return_fea=True)
+        else:
+            h, enc_fea = self.encoder(x, return_fea=True)
+        
+        # 在encoder输出处应用DGConv
+        if 'encoder_output' in self.dgconv_positions:
+            dgconv_out = self.dgconv_modules['encoder_output'](h)
+            h = h + dgconv_out  # 残差连接
+        
+        # 量化
+        moments = self.quant_conv(h)
+        posterior = DiagonalGaussianDistribution(moments)
+        
+        return posterior, enc_fea
+
+    def decode(self, z, enc_fea):
+        """增强的解码过程"""
+        z = self.post_quant_conv(z)
+        
+        # 在decoder输入处应用DGConv
+        if 'decoder_input' in self.dgconv_positions:
+            dgconv_out = self.dgconv_modules['decoder_input'](z)
+            z = z + dgconv_out  # 残差连接
+        
+        # 使用增强解码器或原始解码器
+        if self.enhanced_decoder is not None:
+            dec = self.enhanced_decoder(z, enc_fea)
+        else:
+            dec = self.decoder(z, enc_fea)
+        
+        return dec
+
+    def forward(self, input, latent, sample_posterior=True):
+        posterior, enc_fea_lq = self.encode(input)
+        dec = self.decode(latent, enc_fea_lq)
+        return dec, posterior    
+    
+
+# class AutoencoderKLResiPlus(AutoencoderKLResi):
+#     def __init__(self,
+#                  ddconfig,
+#                  lossconfig,
+#                  embed_dim,
+#                  ckpt_path=None,
+#                  ignore_keys=[],
+#                  image_key="image",
+#                  colorize_nlabels=None,
+#                  monitor=None,
+#                  fusion_w=1.0,
+#                  freeze_dec=True,
+#                  synthesis_data=False,
+#                  use_usm=False,
+#                  test_gt=False,
+#                  dgconv_kernel_size=3):
+#         super().__init__(ddconfig, lossconfig, embed_dim, ckpt_path, ignore_keys, image_key, colorize_nlabels,
+#                          monitor, fusion_w, freeze_dec, synthesis_data, use_usm, test_gt)
+
+#         # 初始化 DGConv 模块
+#         self.dgconv = DGConvModule(kernel_size=dgconv_kernel_size)
+
+#         # 在解码器中添加对增强特征的处理能力
+#         self.enhanced_decoder = Decoder_Mix(**ddconfig)
+#         self.enhanced_decoder.fusion_w = fusion_w
+
+#     def encode(self, x):
+#         h, enc_fea = self.encoder(x, return_fea=True)
+#         dgconv_output = self.dgconv(h)  # 对编码特征进行增强
+#         h = h + dgconv_output  # 增强特征与原始特征进行残差连接
+#         moments = self.quant_conv(h)
+#         posterior = DiagonalGaussianDistribution(moments)
+#         return posterior, enc_fea
+
+#     # def decode(self, z, enc_fea):
+#     #     # 使用增强后的解码器处理经过增强的特征
+#     #     z = self.post_quant_conv(z)
+#     #     dec = self.enhanced_decoder(z, enc_fea)  # 使用增强的解码器
+#     #     return dec
+#     def decode(self, z, enc_fea):
+#         z = self.post_quant_conv(z)
+#         # 直接使用继承的 decoder
+#         dec = self.decoder(z, enc_fea)  
+#         return dec
+#     def forward(self, input, latent, sample_posterior=True):
+#         posterior, enc_fea_lq = self.encode(input)
+#         dec = self.decode(latent, enc_fea_lq)
+#         return dec, posterior
