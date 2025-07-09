@@ -1,4 +1,4 @@
-<p align="center">
+# SharpSR<p align="center">
   <img src="https://user-images.githubusercontent.com/22350795/236680126-0b1cdd62-d6fc-4620-b998-75ed6c31bf6f.png" height=40>
 </p>
 
@@ -220,3 +220,6 @@ This project is based on [stablediffusion](https://github.com/Stability-AI/stabl
 
 ### Contact
 If you have any questions, please feel free to reach me out at `iceclearwjy@gmail.com`.
+
+
+
